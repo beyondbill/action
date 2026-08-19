@@ -131,6 +131,28 @@ def configure_terragrunt_env(config: Dict):
     os.environ.setdefault('TG_NON_INTERACTIVE', 'true')
     os.environ.setdefault('TERRAGRUNT_NON_INTERACTIVE', 'true')
 
+    # `terragrunt render` fully evaluates each unit's config, including the
+    # remote_state block in root.hcl which reads these via get_env(). They're
+    # never used for actual state during config building, so provide harmless
+    # defaults to prevent EnvVarNotFoundError from failing every render (which
+    # would silently drop all terraform.source / module tracking). Real values
+    # from the Terrateam runtime take precedence via setdefault.
+    os.environ.setdefault('TERRAFORM_STATE_BUCKET_NAME', 'config-builder-placeholder')
+    os.environ.setdefault('TERRAFORM_STATE_BUCKET_KMS_KEY_ID', 'config-builder-placeholder')
+
+    # Other get_env() calls without a default that appear in unit inputs/locals.
+    # These only feed values that render doesn't actually use during config
+    # building, so a placeholder is enough to keep the render from aborting.
+    # setdefault means any real value in the environment still wins.
+    for placeholder_env in (
+        'GLEAN_API_KEY',
+        'AWS_IDG_PROD_EXTERNAL_ID',
+        'CI_PROJECT_NAME',
+        'CI_PROJECT_ROOT_NAMESPACE',
+        'CI_SERVER_FQDN',
+    ):
+        os.environ.setdefault(placeholder_env, 'config-builder-placeholder')
+
     if not engine:
         os.environ.setdefault('TG_DEFAULT_VERSION', TERRAGRUNT_DEFAULT_VERSION)
         log(f"No Terragrunt engine found; using Terragrunt {TERRAGRUNT_DEFAULT_VERSION} for discovery", "WARN")
@@ -153,12 +175,25 @@ def configure_terragrunt_env(config: Dict):
     log(f"Using Terragrunt {version} for dependency discovery")
 
 
-def normalize_path(path: str, root_path: str) -> str:
+def normalize_path(path: str, root_path: str, base_dir: str = "") -> str:
     """
     Normalize a path to repository-relative form.
+
+    Args:
+        path: The path to normalize. May be absolute, repo-relative, or
+            relative to base_dir (e.g. Terragrunt reports a unit's
+            dependencies relative to that unit's own directory).
+        root_path: Repository root path.
+        base_dir: Directory (repo-relative) that `path` is relative to when
+            `path` is not absolute. Used to turn unit-relative dependency
+            paths like "../../pca" into repo-relative paths.
     """
     if os.path.isabs(path):
         path = os.path.relpath(path, root_path)
+    elif base_dir and (path.startswith("./") or path.startswith("../")):
+        # Terragrunt emits a unit's dependencies relative to that unit, so
+        # resolve them against the unit's directory before normalizing.
+        path = os.path.join(base_dir, path)
 
     path = os.path.normpath(path)
     if path == ".":
@@ -183,7 +218,7 @@ def parse_terragrunt_find_json(stdout: str, root_path: str) -> Dict[str, List[st
 
         path = normalize_path(unit["path"], root_path)
         dependencies = [
-            normalize_path(dep, root_path)
+            normalize_path(dep, root_path, base_dir=path)
             for dep in unit.get("dependencies", [])
             if dep
         ]
@@ -213,7 +248,7 @@ def parse_terragrunt_list_long(stdout: str, root_path: str) -> Dict[str, List[st
         if len(parts) > 2:
             deps_str = ' '.join(parts[2:])
             dependencies = [
-                normalize_path(dep.strip(), root_path)
+                normalize_path(dep.strip(), root_path, base_dir=path)
                 for dep in deps_str.split(',')
                 if dep.strip()
             ]
@@ -282,7 +317,7 @@ def get_terragrunt_dependencies(root_path: str) -> Dict[str, List[str]]:
 
     try:
         # Allow timeout to be configured via environment variable
-        timeout_seconds = int(os.environ.get('TERRAGRUNT_LIST_TIMEOUT', '30'))
+        timeout_seconds = int(os.environ.get('TERRAGRUNT_LIST_TIMEOUT', '100'))
         commands = [
             (
                 ['terragrunt', 'find', '--dependencies', '--format=json', '--non-interactive', '--no-color'],
@@ -322,7 +357,7 @@ def get_terragrunt_dependencies(root_path: str) -> Dict[str, List[str]]:
             return dependency_graph
 
     except subprocess.TimeoutExpired:
-        timeout_seconds = int(os.environ.get('TERRAGRUNT_LIST_TIMEOUT', '30'))
+        timeout_seconds = int(os.environ.get('TERRAGRUNT_LIST_TIMEOUT', '100'))
         log(f"Terragrunt list timed out after {timeout_seconds} seconds", "WARN")
         log("Continuing without dependency graph from Terragrunt", "WARN")
     except FileNotFoundError:
@@ -333,6 +368,126 @@ def get_terragrunt_dependencies(root_path: str) -> Dict[str, List[str]]:
         traceback.print_exc(file=sys.stderr)
 
     return dependency_graph
+
+
+def render_unit_source(root_path: str, dir_path: str, timeout_seconds: int) -> Optional[str]:
+    """
+    Render a single unit and return its resolved local module dir (repo-relative).
+
+    Returns None if the unit has no source, the source is remote/non-local, or
+    render fails. Raises FileNotFoundError if terragrunt is not installed so the
+    caller can abort the whole pass.
+    """
+    unit_dir = os.path.join(root_path, dir_path) if dir_path else root_path
+
+    try:
+        result = subprocess.run(
+            [
+                'terragrunt', 'render', '--json',
+                '--disable-dependent-modules',
+                '--non-interactive', '--no-color',
+            ],
+            cwd=unit_dir,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"terragrunt render timed out for {dir_path or '.'}", "WARN")
+        return None
+    except FileNotFoundError:
+        # terragrunt binary missing; let the caller abort the whole pass.
+        raise
+    except Exception as e:
+        log(f"Error rendering {dir_path or '.'}: {e}", "WARN")
+        return None
+
+    if result.returncode != 0:
+        log(f"terragrunt render failed for {dir_path or '.'} (rc={result.returncode})", "WARN")
+        log(f"stderr: {result.stderr}", "DEBUG")
+        return None
+
+    try:
+        rendered = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        log(f"Could not parse render JSON for {dir_path or '.'}: {e}", "WARN")
+        return None
+
+    terraform = rendered.get('terraform')
+    source = terraform.get('source') if isinstance(terraform, dict) else None
+    if not isinstance(source, str) or not source:
+        return None
+
+    # render resolves get_repo_root() etc. to absolute paths. A source that
+    # is still remote (registry/git) won't be an existing local directory.
+    module_dir = source.split('//', 1)[0]
+    if not os.path.isabs(module_dir):
+        module_dir = os.path.normpath(os.path.join(unit_dir, module_dir))
+
+    if not os.path.isdir(module_dir):
+        log(f"  Non-local terraform source for {dir_path or '.'}: {source}", "DEBUG")
+        return None
+
+    normalized = normalize_path(module_dir, root_path)
+    log(f"  Resolved local source for {dir_path or '.'}: {source} -> {normalized}", "DEBUG")
+    return normalized
+
+
+def get_terragrunt_local_sources(root_path: str, terragrunt_dirs: List[str]) -> Dict[str, List[str]]:
+    """
+    Resolve each unit's terraform.source via `terragrunt render --json`.
+
+    Unlike static HCL parsing, this evaluates includes, locals, and functions
+    like get_repo_root(), so sources defined in included *.hcl files (e.g.
+    _env/iam.hcl) and built from interpolations are fully resolved. Only local
+    (on-disk) module sources are returned, normalized to repo-relative paths.
+
+    Renders run in parallel (one subprocess per unit) since each is independent
+    and I/O-bound. Parallelism is configurable via TERRAGRUNT_RENDER_PARALLELISM.
+
+    Args:
+        root_path: Repository root path.
+        terragrunt_dirs: Repo-relative directories containing terragrunt.hcl.
+
+    Returns:
+        Dictionary mapping each directory to a list of repo-relative local
+        module source paths (usually one, possibly empty).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    local_sources: Dict[str, List[str]] = {}
+
+    timeout_seconds = int(os.environ.get('TERRAGRUNT_RENDER_TIMEOUT', '30'))
+
+    default_workers = min(16, (os.cpu_count() or 4) * 2)
+    max_workers = int(os.environ.get('TERRAGRUNT_RENDER_PARALLELISM', str(default_workers)))
+    max_workers = max(1, min(max_workers, len(terragrunt_dirs) or 1))
+
+    log(f"Rendering {len(terragrunt_dirs)} units with {max_workers} workers "
+        f"(timeout: {timeout_seconds}s each)...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_dir = {
+            executor.submit(render_unit_source, root_path, dir_path, timeout_seconds): dir_path
+            for dir_path in terragrunt_dirs
+        }
+
+        for future in as_completed(future_to_dir):
+            dir_path = future_to_dir[future]
+            try:
+                normalized = future.result()
+            except FileNotFoundError:
+                log("terragrunt command not found; skipping source resolution.", "ERROR")
+                return local_sources
+            except Exception as e:
+                log(f"Unexpected error resolving source for {dir_path or '.'}: {e}", "WARN")
+                continue
+
+            if normalized:
+                local_sources[dir_path] = [normalized]
+
+    log(f"Resolved local terraform sources for {len(local_sources)} units")
+    return local_sources
 
 
 def iter_hcl_blocks(block_data) -> Iterable[Dict]:
@@ -384,6 +539,54 @@ def find_in_parent_folders_target(value: str) -> Optional[str]:
     return match.group(1) or match.group(2) or 'terragrunt.hcl'
 
 
+def dirname_find_in_parent_folders_target(value: str) -> Optional[tuple]:
+    """
+    Parse ${dirname(find_in_parent_folders("X"))}/suffix include paths.
+
+    This is a common idiom for pointing at sibling config directories relative
+    to a repo-level anchor file (e.g.
+    ${dirname(find_in_parent_folders("root.hcl"))}/_env/iam.hcl).
+
+    Returns:
+        (anchor_filename, suffix) where anchor_filename is the file located by
+        find_in_parent_folders and suffix is the literal path appended after its
+        directory. Returns None if the value doesn't match this pattern.
+    """
+    match = re.fullmatch(
+        r'\$\{\s*dirname\(\s*find_in_parent_folders\(\s*(?:"([^"]+)"|\'([^\']+)\')?\s*\)\s*\)\s*\}'
+        r'/(.+)',
+        value
+    )
+
+    if not match:
+        return None
+
+    anchor = match.group(1) or match.group(2) or 'terragrunt.hcl'
+    suffix = match.group(3)
+    return anchor, suffix
+
+
+def get_terragrunt_dir_suffix(value: str) -> Optional[str]:
+    """
+    Parse ${get_terragrunt_dir()}/suffix include paths.
+
+    get_terragrunt_dir() resolves to the directory of the current unit's
+    terragrunt.hcl, so the suffix is simply a path relative to base_dir
+    (e.g. ${get_terragrunt_dir()}/../../_env/app.hcl).
+
+    Returns the suffix (path relative to the unit dir) or None.
+    """
+    match = re.fullmatch(
+        r'\$\{\s*get_terragrunt_dir\(\s*\)\s*\}/(.+)',
+        value
+    )
+
+    if not match:
+        return None
+
+    return match.group(1)
+
+
 def find_parent_config(base_dir: str, config_file: str, root_path: str) -> Optional[str]:
     """
     Resolve find_in_parent_folders by walking from base_dir toward root_path.
@@ -417,6 +620,34 @@ def resolve_include_path(base_dir: str, path_value: str, root_path: str) -> Opti
             return resolved
 
         log(f"Could not resolve find_in_parent_folders({parent_target}) from {base_dir}", "WARN")
+        return None
+
+    # Handle ${dirname(find_in_parent_folders("X"))}/suffix (e.g. _env/*.hcl).
+    dirname_target = dirname_find_in_parent_folders_target(path_value)
+    if dirname_target:
+        anchor, suffix = dirname_target
+        anchor_config = find_parent_config(base_dir, anchor, root_path)
+        if anchor_config:
+            anchor_dir = os.path.dirname(anchor_config)
+            resolved = normalize_path(os.path.join(anchor_dir, suffix), root_path)
+            candidate = Path(root_path).resolve() / resolved
+            if candidate.exists():
+                return resolved
+            log(f"Resolved include path does not exist: {path_value} -> {resolved}", "WARN")
+            return None
+
+        log(f"Could not resolve dirname(find_in_parent_folders({anchor})) from {base_dir}", "WARN")
+        return None
+
+    # Handle ${get_terragrunt_dir()}/suffix (relative to the unit directory).
+    dir_suffix = get_terragrunt_dir_suffix(path_value)
+    if dir_suffix:
+        resolved = resolve_relative_path(base_dir, dir_suffix)
+        if resolved:
+            candidate = Path(root_path).resolve() / resolved
+            if candidate.exists():
+                return resolved
+            log(f"Resolved include path does not exist: {path_value} -> {resolved}", "WARN")
         return None
 
     if path_value.startswith('${'):
@@ -497,11 +728,13 @@ def parse_terragrunt_dependencies(file_path: str, base_dir: str, root_path: Opti
         if 'dependency' in parsed:
             for dependency_block in iter_hcl_blocks(parsed['dependency']):
                 config_path = hcl_string(dependency_block.get('config_path'))
-                if config_path and not config_path.startswith('${'):
+                if config_path and '${' not in config_path:
                     resolved_path = resolve_relative_path(base_dir, config_path)
                     if resolved_path:
                         result['dependencies'].append(resolved_path)
                         log(f"  Found dependency: {config_path} -> {resolved_path}", "DEBUG")
+                elif config_path:
+                    log(f"  Skipping dependency with unresolved interpolation: {config_path}", "WARN")
 
         # Extract dependencies { paths = ["../dir"] } blocks.
         if 'dependencies' in parsed:
@@ -512,11 +745,13 @@ def parse_terragrunt_dependencies(file_path: str, base_dir: str, root_path: Opti
 
                 for dep_path in paths:
                     dep_path = hcl_string(dep_path)
-                    if dep_path and not dep_path.startswith('${'):
+                    if dep_path and '${' not in dep_path:
                         resolved_path = resolve_relative_path(base_dir, dep_path)
                         if resolved_path:
                             result['dependencies'].append(resolved_path)
                             log(f"  Found dependency path: {dep_path} -> {resolved_path}", "DEBUG")
+                    elif dep_path:
+                        log(f"  Skipping dependency path with unresolved interpolation: {dep_path}", "WARN")
 
         # Extract locals.extra_terrateam_dependencies or locals.extra_atlantis_dependencies
         if 'locals' in parsed:
@@ -621,39 +856,6 @@ def resolve_relative_path(base_dir: str, relative_path: str) -> Optional[str]:
         return None
 
 
-def find_parent_configs(base_dir: str) -> List[str]:
-    """
-    Find parent terragrunt.hcl or *.hcl files by walking up the directory tree.
-
-    Args:
-        base_dir: The starting directory (relative to repo root)
-
-    Returns:
-        List of parent config file paths (relative to repo root)
-    """
-    parent_configs = []
-    current = base_dir
-
-    # Walk up the directory tree
-    while current:
-        parent = os.path.dirname(current)
-        if parent == current:  # Reached root
-            break
-
-        # Check for common parent config files
-        for config_file in ['terragrunt.hcl', 'root.hcl', 'common.hcl']:
-            config_path = os.path.join(parent, config_file) if parent else config_file
-            parent_configs.append(config_path)
-
-        current = parent
-
-    # Also check root directory
-    for config_file in ['terragrunt.hcl', 'repo.hcl', 'aws.hcl', 'provision.hcl']:
-        parent_configs.append(config_file)
-
-    return parent_configs
-
-
 def generate_terrateam_config(
     input_config: Dict,
     terragrunt_dirs: List[str],
@@ -681,27 +883,41 @@ def generate_terrateam_config(
     for dir_path in terragrunt_dirs:
         deps = all_dependencies.get(dir_path, {})
 
-        # Build file_patterns list
+        # Build file_patterns list. Terragrunt unit directories contain
+        # terragrunt.hcl (not raw *.tf/*.tfvars), so only track that here;
+        # the actual module .tf files are tracked via resolved terraform.source.
         file_patterns = [
             "${DIR}/terragrunt.hcl",
-            "${DIR}/*.tf",
-            "${DIR}/*.tfvars",
         ]
 
-        # Add parent config files (includes)
-        for include in deps.get("includes", []):
+        # Add parent config files (includes). Sort for deterministic output.
+        for include in sorted(dedupe(deps.get("includes", []))):
             file_patterns.append(include)
 
-        # Add local terraform module sources
-        for source in deps.get("terraform_sources", []):
+        # Add local terraform module sources. Prefer sources resolved via
+        # `terragrunt render` (which evaluates includes/locals/get_repo_root),
+        # falling back to statically-parsed sources only when render found none.
+        module_sources = deps.get("resolved_sources") or deps.get("terraform_sources", [])
+        for source in sorted(dedupe(module_sources)):
             # Add glob pattern for all .tf files in the module
             file_patterns.append(f"{source}/**/*.tf")
 
-        # Add extra dependencies
-        for extra in deps.get("extra_deps", []):
+        # Add extra dependencies. Sort for deterministic output.
+        for extra in sorted(dedupe(deps.get("extra_deps", []))):
             file_patterns.append(extra)
 
-        direct_deps = dedupe(dependency_graph.get(dir_path, []) + deps.get("dependencies", []))
+        # Prefer the resolved dependency graph from `terragrunt find`/`list`.
+        # Only fall back to statically-parsed dependency blocks when Terragrunt
+        # discovery produced nothing for this directory, since the static parser
+        # (python-hcl2) cannot evaluate interpolations like ${local.foo} and would
+        # otherwise leak unresolved paths into file_patterns/depends_on.
+        # Sort for deterministic output (Terragrunt's ordering is not stable
+        # across runs, and depends_on has set semantics where order is irrelevant).
+        resolved_deps = dependency_graph.get(dir_path)
+        if resolved_deps:
+            direct_deps = sorted(dedupe(resolved_deps))
+        else:
+            direct_deps = sorted(dedupe(deps.get("dependencies", [])))
 
         # Add dependency terragrunt.hcl files
         for dep_dir in direct_deps:
@@ -726,6 +942,12 @@ def generate_terrateam_config(
         # Add to output config (use empty string for root, otherwise the dir path)
         config_key = dir_path if dir_path else "."
         output_config["dirs"][config_key] = dir_config
+
+    # Sort dirs keys for deterministic output regardless of discovery order.
+    output_config["dirs"] = {
+        key: output_config["dirs"][key]
+        for key in sorted(output_config["dirs"])
+    }
 
     return output_config
 
@@ -770,6 +992,15 @@ def main():
         for dir_path in terragrunt_dirs:
             file_path = os.path.join(repo_root, dir_path, "terragrunt.hcl")
             all_dependencies[dir_path] = parse_terragrunt_dependencies(file_path, dir_path, repo_root)
+
+        # Phase 3b: Resolve each unit's terraform.source via `terragrunt render`
+        # so module directories (including those from included *.hcl files and
+        # get_repo_root()-based sources) are tracked in when_modified.
+        log("Phase 3b: Resolving terraform sources via terragrunt render...")
+        local_sources = get_terragrunt_local_sources(repo_root, terragrunt_dirs)
+        for dir_path, sources in local_sources.items():
+            if dir_path in all_dependencies:
+                all_dependencies[dir_path]["resolved_sources"] = sources
 
         # Phase 4: Generate Terrateam config
         log("Phase 4: Generating Terrateam configuration...")

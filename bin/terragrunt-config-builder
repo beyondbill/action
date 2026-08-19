@@ -587,6 +587,45 @@ def get_terragrunt_dir_suffix(value: str) -> Optional[str]:
     return match.group(1)
 
 
+# Matches read_terragrunt_config(find_in_parent_folders("X")) anywhere in a
+# config file (locals, inputs, dependency blocks, etc.). The inner filename is
+# captured so it can be located via a parent-folder walk from the unit dir.
+_READ_TG_CONFIG_FIP_RE = re.compile(
+    r'read_terragrunt_config\(\s*find_in_parent_folders\(\s*'
+    r'(?:"([^"]+)"|\'([^\']+)\')?\s*\)\s*\)'
+)
+
+
+def extract_read_terragrunt_config_targets(file_path: str) -> List[str]:
+    """
+    Extract filenames referenced via read_terragrunt_config(find_in_parent_folders("X")).
+
+    Terragrunt configs frequently pull in sibling/ancestor config files this way
+    (e.g. read_terragrunt_config(find_in_parent_folders("region.hcl"))). These are
+    real dependencies of the unit but are not include blocks, so they must be
+    discovered by scanning the file's contents.
+
+    Args:
+        file_path: Absolute path to the .hcl file to scan.
+
+    Returns:
+        List of referenced filenames (e.g. ["region.hcl", "account.hcl"]).
+        Defaults an omitted argument to "terragrunt.hcl" to match Terragrunt.
+    """
+    targets: List[str] = []
+
+    try:
+        with open(file_path, 'r') as f:
+            contents = f.read()
+    except OSError:
+        return targets
+
+    for match in _READ_TG_CONFIG_FIP_RE.finditer(contents):
+        targets.append(match.group(1) or match.group(2) or 'terragrunt.hcl')
+
+    return targets
+
+
 def find_parent_config(base_dir: str, config_file: str, root_path: str) -> Optional[str]:
     """
     Resolve find_in_parent_folders by walking from base_dir toward root_path.
@@ -655,6 +694,66 @@ def resolve_include_path(base_dir: str, path_value: str, root_path: str) -> Opti
         return None
 
     return resolve_relative_path(base_dir, path_value)
+
+
+def collect_read_config_deps(
+    base_dir: str,
+    root_path: str,
+    seed_files: List[str],
+) -> List[str]:
+    """
+    Follow read_terragrunt_config(find_in_parent_folders("X")) references transitively.
+
+    Terragrunt configs (the unit's terragrunt.hcl and any files it includes, e.g.
+    _env/*.hcl) frequently read additional config files via
+    read_terragrunt_config(find_in_parent_folders("X")). At runtime,
+    find_in_parent_folders resolves relative to the *including unit*, so every
+    referenced file is a real dependency of the unit and should trigger a plan
+    when modified.
+
+    This walks the graph starting from seed_files, scanning each file for such
+    references, resolving each target via a parent-folder walk from the unit's
+    base_dir, and recursing into newly discovered files. Cycles are avoided by
+    tracking visited files.
+
+    Args:
+        base_dir: The unit directory (repo-relative), used as the parent-search
+            origin to mirror Terragrunt's runtime semantics.
+        root_path: Repository root path.
+        seed_files: Repo-relative paths of the initial config files to scan
+            (typically the unit's terragrunt.hcl plus its resolved includes).
+
+    Returns:
+        Sorted list of repo-relative paths for every config file referenced via
+        read_terragrunt_config(find_in_parent_folders(...)), excluding the seeds.
+    """
+    root = Path(root_path).resolve()
+    discovered: List[str] = []
+    seen_targets = set()
+    scanned = set()
+    queue = list(seed_files)
+
+    while queue:
+        rel_file = queue.pop(0)
+        if rel_file in scanned:
+            continue
+        scanned.add(rel_file)
+
+        abs_file = root / rel_file
+        for target in extract_read_terragrunt_config_targets(str(abs_file)):
+            resolved = find_parent_config(base_dir, target, root_path)
+            if not resolved or resolved in seen_targets:
+                continue
+
+            seen_targets.add(resolved)
+            discovered.append(resolved)
+            log(f"  Found read_terragrunt_config dep: {target} -> {resolved}", "DEBUG")
+
+            # Recurse into the referenced file to follow chained reads.
+            if resolved not in scanned:
+                queue.append(resolved)
+
+    return sorted(discovered)
 
 
 def parse_terragrunt_dependencies(file_path: str, base_dir: str, root_path: Optional[str] = None) -> Dict[str, List[str]]:
@@ -776,6 +875,16 @@ def parse_terragrunt_dependencies(file_path: str, base_dir: str, root_path: Opti
                                 if resolved_path:
                                     result['extra_deps'].append(resolved_path)
                                     log(f"  Found extra dependency ({extra_deps_key}): {dep} -> {resolved_path}", "DEBUG")
+
+        # Follow read_terragrunt_config(find_in_parent_folders("X")) references in
+        # the unit and its included files (e.g. _env/*.hcl reading region.hcl,
+        # account.hcl, module.hcl). These are transitive dependencies of the unit
+        # and belong in when_modified.file_patterns.
+        unit_file = normalize_path(file_path, root_path)
+        seed_files = dedupe([unit_file] + result['includes'])
+        for read_dep in collect_read_config_deps(base_dir, root_path, seed_files):
+            if read_dep not in result['includes']:
+                result['includes'].append(read_dep)
 
     except (ImportError, subprocess.CalledProcessError) as e:
         log(f"Could not install python-hcl2. Cannot parse {file_path}: {e}", "ERROR")

@@ -139,6 +139,8 @@ def configure_terragrunt_env(config: Dict):
     # from the Terrateam runtime take precedence via setdefault.
     os.environ.setdefault('TERRAFORM_STATE_BUCKET_NAME', 'config-builder-placeholder')
     os.environ.setdefault('TERRAFORM_STATE_BUCKET_KMS_KEY_ID', 'config-builder-placeholder')
+    os.environ.setdefault('TERRATEAM_PLANS_GOV_STAGE_BUCKET_NAME', 'config-builder-placeholder')
+    os.environ.setdefault('TERRATEAM_PLANS_GOV_STAGE_BUCKET_KMS_KEY_ID', 'config-builder-placeholder')
 
     # Other get_env() calls without a default that appear in unit inputs/locals.
     # These only feed values that render doesn't actually use during config

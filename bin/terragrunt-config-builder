@@ -1010,8 +1010,11 @@ def generate_terrateam_config(
         # falling back to statically-parsed sources only when render found none.
         module_sources = deps.get("resolved_sources") or deps.get("terraform_sources", [])
         for source in sorted(dedupe(module_sources)):
-            # Add glob pattern for all .tf files in the module
-            file_patterns.append(f"{source}/**/*.tf")
+            # Track every file in the module, not just *.tf: modules also read
+            # templates and data files (e.g. templates/*.tftpl). Docs never
+            # affect a plan, so exclude Markdown.
+            file_patterns.append(f"{source}/**")
+            file_patterns.append(f"!{source}/**/*.md")
 
         # Add extra dependencies. Sort for deterministic output.
         for extra in sorted(dedupe(deps.get("extra_deps", []))):
@@ -1038,8 +1041,8 @@ def generate_terrateam_config(
 
         # Build dir configuration
         dir_config = {
-            "create_and_select_workspace": False,
             "tags": ["terragrunt-layered"],
+            "create_and_select_workspace": False,
             "when_modified": {
                 "file_patterns": file_patterns
             }
